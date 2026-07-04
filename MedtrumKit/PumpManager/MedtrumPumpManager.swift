@@ -1061,7 +1061,7 @@ public extension MedtrumPumpManager {
             delegate?.pumpManager(
                 self,
                 didReadReservoirValue: self.state.reservoir.rounded(toPlaces: 1),
-                at: self.state.lastSync
+                at: Date.now
             ) { result in
                 switch result {
                 case let .failure(error):
