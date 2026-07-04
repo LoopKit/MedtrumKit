@@ -914,7 +914,6 @@ public extension MedtrumPumpManager {
         doseEntry.deliveredUnits = delivered
 
         if !completed {
-            notifyStateDidChange()
             return
         }
 
