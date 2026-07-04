@@ -332,8 +332,6 @@ extension PeripheralManager: CBPeripheralDelegate {
             }
 
             let response = self.writePacket(SynchronizePacket())
-            StateSyncer.fetchPatchTime(pumpManager: self.pumpManager)
-
             switch response {
             case let .failure(error):
                 self.log.error("Failed to get synchronize: \(error.localizedDescription)")
@@ -346,6 +344,7 @@ extension PeripheralManager: CBPeripheralDelegate {
                 }
 
                 self.parseStateUpdate(syncResponse, duringReconnect: false, fullSync: true)
+                StateSyncer.fetchPatchTime(pumpManager: self.pumpManager)
             }
         }
     }
