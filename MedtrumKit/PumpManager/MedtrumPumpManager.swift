@@ -794,7 +794,7 @@ public extension MedtrumPumpManager {
 
         state.patchId = Data()
         state.pumpState = .none
-        self.state.backupSessionToken = self.state.sessionToken
+        state.backupSessionToken = state.sessionToken
         state.sessionToken = Data()
         state.lastSync = Date.now
         state.basalDose = suspendDose

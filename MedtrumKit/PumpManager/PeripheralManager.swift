@@ -98,7 +98,7 @@ extension PeripheralManager {
                 doAuthorize(useBackupToken: true)
                 return
             }
-            
+
             log.error("Failed to complete authorization flow: \(error.localizedDescription)")
             bluetoothManager.disconnect()
             completion?(.failedToCompleteAuthorizationFlow(localizedError: error.localizedDescription))
