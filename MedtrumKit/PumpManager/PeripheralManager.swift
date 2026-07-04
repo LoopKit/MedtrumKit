@@ -85,13 +85,20 @@ class PeripheralManager: NSObject {
 
 extension PeripheralManager {
     // Connect step 1
-    private func doAuthorize() {
+    private func doAuthorize(useBackupToken: Bool = false) {
+        let token = !useBackupToken ? pumpManager.state.sessionToken : pumpManager.state.backupSessionToken
         let authData = writePacket(
-            AuthorizePacket(pumpSN: pumpManager.state.pumpSN, sessionToken: pumpManager.state.sessionToken)
+            AuthorizePacket(pumpSN: pumpManager.state.pumpSN, sessionToken: token)
         )
 
         switch authData {
         case let .failure(error):
+            if !useBackupToken {
+                log.warning("Failed to complete authorization flow, falling back to backup token")
+                doAuthorize(useBackupToken: true)
+                return
+            }
+            
             log.error("Failed to complete authorization flow: \(error.localizedDescription)")
             bluetoothManager.disconnect()
             completion?(.failedToCompleteAuthorizationFlow(localizedError: error.localizedDescription))
