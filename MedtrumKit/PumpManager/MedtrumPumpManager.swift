@@ -900,20 +900,26 @@ public extension MedtrumPumpManager {
 
     internal func emitAlert(alertType: MedtrumAlert) {
         pumpDelegate.notify { delegate in
-            delegate?.issueAlert(alertType.alert)
+            // PumpManagerDelegate.issueAlert is async. Both calls stay inside one
+            // Task so the alert is still issued before the pump event, as it was
+            // when the delegate API was synchronous -- wrapping only the alert
+            // would let the two race.
+            Task {
+                await delegate?.issueAlert(alertType.alert)
 
-            if let pumpEvent = NewPumpEvent.alert(type: alertType) {
-                delegate?.pumpManager(
-                    self,
-                    hasNewPumpEvents: [pumpEvent],
-                    lastReconciliation: self.state.lastSync,
-                    replacePendingEvents: false,
-                    completion: { error in
-                        if let error = error {
-                            self.handlePumpDelegateError(method: "hasNewPumpEvents", error)
+                if let pumpEvent = NewPumpEvent.alert(type: alertType) {
+                    delegate?.pumpManager(
+                        self,
+                        hasNewPumpEvents: [pumpEvent],
+                        lastReconciliation: self.state.lastSync,
+                        replacePendingEvents: false,
+                        completion: { error in
+                            if let error = error {
+                                self.handlePumpDelegateError(method: "hasNewPumpEvents", error)
+                            }
                         }
-                    }
-                )
+                    )
+                }
             }
         }
     }
