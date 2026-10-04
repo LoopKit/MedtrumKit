@@ -2,22 +2,36 @@ import CoreBluetooth
 
 class PeripheralManager: NSObject {
     private let log = MedtrumLogger(category: "PeripheralManager")
-    private let queue = DispatchQueue(label: "org.nightscout.MedtrumKit.message-queue")
 
     private let peripheral: CBPeripheral
-    private let bluetoothManager: BluetoothManager
-    private let pumpManager: MedtrumPumpManager
+    private weak var bluetoothManager: BluetoothManager?
+    private weak var pumpManager: MedtrumPumpManager?
     private var completion: ((MedtrumConnectError?) -> Void)?
 
     private var readCharacteristic: CBCharacteristic?
     private var writeCharacteristic: CBCharacteristic?
 
+    // access is serialized by the semaphore inside writePacket
     private var writeSequence: UInt8 = 0
-    private var currentPacket: (any MedtrumBasePacketProtocol)?
 
+    /// Guards the four fields below. writePacket runs on the caller's thread while the response
+    /// arrives on the central manager's queue, so every access to them is cross-thread. Never
+    /// held across `writeQ.wait()`, `peripheral.writeValue` or `leave()`.
+    private let stateLock = NSLock()
+
+    /* access must be serialized with stateLock */
+    private var currentPacket: (any MedtrumBasePacketProtocol)?
+    private var currentSequence: UInt8 = 0
     private var writeQueue: MedtrumKitDispatchGroup?
     private var writeResponse: MedtrumWriteResult<Any>?
+    private var isInvalidated = false
+    private var isReadyStorage = false
+    /* end */
+
     private let semaphore = DispatchSemaphore(value: 1)
+
+    /* access must be serialized with stateLock, prevents concurrent `considerFullSync` runs */
+    private var isFullSyncInFlight = false
 
     public init(
         _ peripheral: CBPeripheral,
@@ -36,10 +50,32 @@ class PeripheralManager: NSObject {
     }
 
     func cleanup() {
-        if let queue = writeQueue {
-            queue.leave()
-            writeQueue = nil
-        }
+        stateLock.lock()
+        isInvalidated = true
+        let queue = writeQueue
+        writeQueue = nil
+        currentPacket = nil
+        stateLock.unlock()
+
+        // outside the lock: leave() takes a lock of its own, and it wakes writePacket, which
+        // immediately wants ours.
+        queue?.leave()
+    }
+
+    private func disconnectIfActive() {
+        bluetoothManager?.disconnect(ifCurrent: self)
+    }
+
+    var isReady: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isReadyStorage
+    }
+
+    private var isInvalidatedLocked: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isInvalidated
     }
 
     func writePacket(_ packet: any MedtrumBasePacketProtocol) -> MedtrumWriteResult<Any> {
@@ -55,8 +91,19 @@ class PeripheralManager: NSObject {
 
         let writeQ = MedtrumKitDispatchGroup()
         writeQ.enter()
+
+        stateLock.lock()
+        guard !isInvalidated else {
+            stateLock.unlock()
+            // Balance the enter above: the group has to be entered before it is published, or
+            // cleanup could leave() it first and this write would then wait out its full timeout.
+            writeQ.leave()
+            return .failure(error: .noManager)
+        }
         writeQueue = writeQ
         currentPacket = packet
+        currentSequence = writeSequence
+        stateLock.unlock()
 
         let packages = packet.encode(sequenceNumber: writeSequence)
         writeSequence = UInt8(writeSequence + 1)
@@ -71,34 +118,53 @@ class PeripheralManager: NSObject {
 
         // Wait for response or timeout timer...
         _ = writeQ.wait(timeout: .now() + .seconds(30))
-        writeQueue = nil
 
-        guard let response = writeResponse else {
+        // Tear down as one step: on timeout the delegate may still be mid-flight, and this is
+        // what tells it the command is no longer current.
+        stateLock.lock()
+        let response = writeResponse
+        writeQueue = nil
+        currentPacket = nil
+        writeResponse = nil
+        stateLock.unlock()
+
+        guard let response = response else {
             log.warning("Timeout has been reached...")
             return .failure(error: .timeout)
         }
 
-        writeResponse = nil
         return response
     }
 }
 
 extension PeripheralManager {
     // Connect step 1
-    private func doAuthorize() {
+    private func doAuthorize(useBackupToken: Bool = false) {
+        guard let pumpManager else {
+            return
+        }
+
+        let token = !useBackupToken ? pumpManager.state.sessionToken : pumpManager.state.backupSessionToken
         let authData = writePacket(
-            AuthorizePacket(pumpSN: pumpManager.state.pumpSN, sessionToken: pumpManager.state.sessionToken)
+            AuthorizePacket(pumpSN: pumpManager.state.pumpSN, sessionToken: token)
         )
 
         switch authData {
         case let .failure(error):
+            if !useBackupToken {
+                log.warning("Failed to complete authorization flow, falling back to backup token")
+                doAuthorize(useBackupToken: true)
+                return
+            }
+
             log.error("Failed to complete authorization flow: \(error.localizedDescription)")
-            bluetoothManager.disconnect()
+            disconnectIfActive()
             completion?(.failedToCompleteAuthorizationFlow(localizedError: error.localizedDescription))
 
         case let .success(data):
             guard let authResponse = data as? AuthorizeResponse else {
                 log.error("Failed to complete authorization flow: invalid response")
+                disconnectIfActive()
                 completion?(.failedToCompleteAuthorizationFlow(localizedError: "invalid response"))
                 return
             }
@@ -117,12 +183,13 @@ extension PeripheralManager {
         switch syncData {
         case let .failure(error):
             log.error("Failed to synchronize: \(error.localizedDescription)")
-            bluetoothManager.disconnect()
+            disconnectIfActive()
             completion?(.failedToCompleteAuthorizationFlow(localizedError: error.localizedDescription))
 
         case let .success(data):
             guard let syncResponse = data as? SynchronizePacketResponse else {
                 log.error("Failed to Synchronize packet: invalid response")
+                disconnectIfActive()
                 completion?(.failedToCompleteAuthorizationFlow(localizedError: "invalid response"))
                 return
             }
@@ -139,19 +206,35 @@ extension PeripheralManager {
         switch subscribeData {
         case let .failure(error):
             log.error("Failed to subscribe: \(error.localizedDescription)")
-            bluetoothManager.disconnect()
+            disconnectIfActive()
             completion?(.failedToCompleteAuthorizationFlow(localizedError: error.localizedDescription))
 
         case .success:
+            guard !isInvalidatedLocked else {
+                return
+            }
+
             log.info("Connected to pump!")
 
-            pumpManager.state.isConnected = false
-            pumpManager.notifyStateDidChange()
+            stateLock.lock()
+            isReadyStorage = true
+            stateLock.unlock()
+
+            pumpManager?.state.isConnected = true
+            pumpManager?.notifyStateDidChange()
             completion?(nil)
         }
     }
 
     private func parseStateUpdate(_ syncResponse: SynchronizePacketResponse, duringReconnect: Bool, fullSync: Bool) {
+        guard let pumpManager else {
+            return
+        }
+
+        guard !isInvalidatedLocked else {
+            return
+        }
+
         // TEMP
         do {
             log.info("State update: \(String(data: try JSONEncoder().encode(syncResponse), encoding: .utf8) ?? "")")
@@ -166,6 +249,8 @@ extension PeripheralManager {
             duringReconnect: duringReconnect,
             fullSync: fullSync
         )
+
+        pumpManager.issueHeartbeatIfNeeded()
     }
 }
 
@@ -173,6 +258,7 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error = error {
             log.error("\(error.localizedDescription)")
+            disconnectIfActive()
             completion?(.failedToDiscoverServices(localizedError: error.localizedDescription))
             return
         }
@@ -182,6 +268,7 @@ extension PeripheralManager: CBPeripheralDelegate {
             let localizedError = "No Medtrum service found - " +
                 (peripheral.services?.map(\.uuid.uuidString).joined(separator: ", ") ?? "No services discovered")
             log.error(localizedError)
+            disconnectIfActive()
             completion?(.failedToDiscoverServices(localizedError: localizedError))
             return
         }
@@ -192,6 +279,7 @@ extension PeripheralManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         if let error = error {
             log.error("\(error.localizedDescription)")
+            disconnectIfActive()
             completion?(.failedToDiscoverCharacteristics(localizedError: error.localizedDescription))
             return
         }
@@ -204,6 +292,7 @@ extension PeripheralManager: CBPeripheralDelegate {
                 (service.characteristics?.map(\.uuid.uuidString).joined(separator: ", ") ?? "No characteristics discovered")
 
             log.error(localizedError)
+            disconnectIfActive()
             completion?(.failedToDiscoverCharacteristics(localizedError: localizedError))
             return
         }
@@ -237,39 +326,59 @@ extension PeripheralManager: CBPeripheralDelegate {
             return
         }
 
-        guard let data = characteristic.value else {
-            log.warning("No data in didUpdateValueFor - characteristic: \(characteristic.uuid.uuidString)")
+        guard let data = characteristic.value, !data.isEmpty else {
+            log.warning(
+                "No usable data in didUpdateValueFor - characteristic: \(characteristic.uuid.uuidString), " +
+                    "data: \(characteristic.value?.hexEncodedString() ?? "nil")"
+            )
             return
         }
 
         if characteristic.uuid == CBUUID.READ_UUID {
-            guard data[1] != 0x00 else {
-                // Ignore all ping messages from patch pomp
-                return
-            }
-
             handleHeartbeat(data: data)
+
+            considerFullSync()
             return
         }
 
         // Processing data
         log.debug("Got data: \(data.hexEncodedString())")
-        guard var packet = currentPacket else {
+
+        stateLock.lock()
+        let sequence = currentSequence
+        let pending = currentPacket
+        stateLock.unlock()
+
+        guard var packet = pending else {
             log.warning("No packet available...")
             return
         }
 
-        packet.decode(data)
-        currentPacket = packet
-
-        guard packet.isComplete else {
-            log.debug("Waiting for more data...")
+        // Byte 2 echoes the sequence number of the command this is a response to, on every
+        // fragment. It has to be checked on all of them, not just the first: decode() validates
+        // a continuation fragment for ordering and CRC only, so a late fragment of an abandoned
+        // command would otherwise be appended to whatever packet is now in flight - with a valid
+        // CRC and a matching fragment index, so nothing downstream would notice.
+        if data.count > 2, data[2] != sequence {
+            log.warning("Ignoring response for sequence \(data[2]), waiting on \(sequence)")
             return
         }
 
-        guard let writeCallback = writeQueue else {
-            // Timeout is hit...
-            currentPacket = nil
+        packet.decode(data)
+
+        stateLock.lock()
+        guard currentSequence == sequence, writeQueue != nil else {
+            // writePacket timed out while we were decoding, and may already have started
+            // another command. This response is no longer anybody's.
+            stateLock.unlock()
+            log.warning("Discarding response for sequence \(sequence), no longer the current command")
+            return
+        }
+        currentPacket = packet
+        stateLock.unlock()
+
+        guard packet.isComplete else {
+            log.debug("Waiting for more data...")
             return
         }
 
@@ -279,61 +388,91 @@ extension PeripheralManager: CBPeripheralDelegate {
             return
         }
 
+        let response: MedtrumWriteResult<Any>
         if packet.responseCode != 0 {
             // Examples for invalid codes:
             // 7 -> Invalid authorization: propably wrong session token used
             // 8 -> Invalid state: The patch is not in state 32 (active), which is required for that command
             log.error("Invalid responseCode: \(packet.responseCode)")
-            writeResponse = .failure(error: .invalidResponse(code: packet.responseCode))
+            response = .failure(error: .invalidResponse(code: packet.responseCode))
         } else if packet.failed {
             log.error("Failed to parse message, either wrong command type or CRC check failed...")
-            writeResponse = .failure(error: .invalidData)
-        } else {
-            if !packet.hasEnoughData {
-                let message =
-                    "Packet has too little data - expected: \(packet.mimimumDataSize), data: \(packet.totalData.hexEncodedString())"
-                log.error(message)
+            response = .failure(error: .invalidData)
+        } else if !packet.hasEnoughData {
+            let message =
+                "Packet has too little data - expected: \(packet.mimimumDataSize), data: \(packet.totalData.hexEncodedString())"
+            log.error(message)
 
-                writeResponse = .failure(error: .invalidData)
-            } else {
-                writeResponse = .success(data: packet.parseResponse())
-            }
+            response = .failure(error: .invalidData)
+        } else {
+            response = .success(data: packet.parseResponse())
         }
 
-        writeCallback.leave()
+        stateLock.lock()
+        guard currentSequence == sequence, let writeCallback = writeQueue else {
+            // Timed out between decoding and parsing; writePacket has already given up
+            stateLock.unlock()
+            return
+        }
+        writeResponse = response
         writeQueue = nil
         currentPacket = nil
+        stateLock.unlock()
+
+        // Outside the lock, and last: this hands writePacket the fields we just finished with.
+        writeCallback.leave()
     }
 
     private func handleHeartbeat(data: Data) {
-        var data = data
-
         log.debug("READ -> Got data: \(data.hexEncodedString())")
-        data.append(0x00) // Little CRC hack. The notification lacks the CRC value, thus add an empty value there
 
-        var packet = NotificationPacket()
-        packet.decode(data)
+        let packet = NotificationPacket()
+        // not a command response: no header, no CRC
+        packet.totalData = data
 
-        guard Date.now.timeIntervalSince(pumpManager.state.lastSync) > .minutes(2.5) else {
-            parseStateUpdate(packet.parseResponse(), duringReconnect: false, fullSync: false)
+        guard packet.hasEnoughData else {
+            log.error("Heartbeat notification too short to parse: \(data.hexEncodedString())")
+            return
+        }
+
+        parseStateUpdate(packet.parseResponse(), duringReconnect: false, fullSync: false)
+    }
+
+    private func considerFullSync() {
+        guard let pumpManager else {
+            return
+        }
+
+        let age = Date.now.timeIntervalSince(pumpManager.state.lastSync)
+        guard age > MedtrumPumpManager.heartbeatSyncFreshnessInterval else {
             return
         }
 
         guard pumpManager.state.bolusState == .noBolus else {
-            parseStateUpdate(packet.parseResponse(), duringReconnect: false, fullSync: false)
-            log.warning("Skipping sync, pump is currently bolusing")
+            log.debug("Skipping sync, pump is currently bolusing")
             return
         }
 
-        // Do full sync (only every 3min)
+        stateLock.lock()
+        guard !isFullSyncInFlight else {
+            stateLock.unlock()
+            return
+        }
+        isFullSyncInFlight = true
+        stateLock.unlock()
+
+        // Do the full sync off the loop's critical path.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else {
                 return
             }
+            defer {
+                self.stateLock.lock()
+                self.isFullSyncInFlight = false
+                self.stateLock.unlock()
+            }
 
             let response = self.writePacket(SynchronizePacket())
-            StateSyncer.fetchPatchTime(pumpManager: self.pumpManager)
-
             switch response {
             case let .failure(error):
                 self.log.error("Failed to get synchronize: \(error.localizedDescription)")
@@ -346,6 +485,10 @@ extension PeripheralManager: CBPeripheralDelegate {
                 }
 
                 self.parseStateUpdate(syncResponse, duringReconnect: false, fullSync: true)
+
+                if let pumpManager = self.pumpManager {
+                    StateSyncer.fetchPatchTimeIfStale(pumpManager: pumpManager)
+                }
             }
         }
     }

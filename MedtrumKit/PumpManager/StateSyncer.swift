@@ -10,14 +10,16 @@ enum StateSyncer {
         duringReconnect: Bool,
         fullSync: Bool
     ) {
-        if fullSync {
-            pumpManager.state.lastSync = Date.now
-        }
+        let syncDate = Date.now
+        let syncResponse = syncResponse.validated(expectedPatchId: state.patchId.toUInt64())
 
         StateSyncer.updatePumpState(syncResponse: syncResponse, pumpManager: pumpManager)
 
+        let hasActivatedPatch = syncResponse.state.rawValue >= PatchState.active.rawValue
+
         if let reservoir = syncResponse.reservoir {
-            if let lowReservoirWarning = state.lowReservoirWarning,
+            if hasActivatedPatch,
+               let lowReservoirWarning = state.lowReservoirWarning,
                state.reservoir > lowReservoirWarning,
                reservoir < lowReservoirWarning
             {
@@ -27,18 +29,26 @@ enum StateSyncer {
 
             if state.reservoir != reservoir {
                 state.reservoir = reservoir
-                if state.initialReservoir == nil {
-                    state.initialReservoir = state.reservoir
-                }
 
-                if fullSync {
+                if fullSync, hasActivatedPatch {
                     // to prevent spaming the OSAID app with reservoir updates
                     pumpManager.emitReservoirLevel()
                 }
             }
+
+            if hasActivatedPatch, state.initialReservoir == nil {
+                state.initialReservoir = reservoir
+            }
         }
 
-        if let basal = syncResponse.basal {
+        var events: [NewPumpEvent] = []
+        if syncResponse.state.isDeliveryHalted {
+            // a halted state is authoritative even when the notification carries a cached basal.
+            events.append(contentsOf: recordSuspendIfDelivering(
+                state: state, basal: syncResponse.basal, receivedAt: syncDate
+            ))
+            state.basalState = .suspended
+        } else if let basal = syncResponse.basal {
             switch basal.type {
             case .ABSOLUTE_TEMP,
                  .RELATIVE_TEMP:
@@ -60,53 +70,39 @@ enum StateSyncer {
                  .SUSPEND_MORE_THAN_MAX_PER_DAY,
                  .SUSPEND_MORE_THAN_MAX_PER_HOUR,
                  .SUSPEND_PREDICT_LOW_GLUCOSE:
-                if state.basalDose.type == .basal || state.basalDose.type == .resume || state.basalDose.type == .tempBasal {
-                    // Patch unexpectedly suspended itself
-                    let eventTime = Date.now
-                    let dose = state.basalDose.toDoseEntry(isMutable: false, endDate: eventTime)
-                    state.basalDose = UnfinalizedDose(suspendStartTime: eventTime)
-                    let basalDose = state.basalDose.toDoseEntry()
-
-                    var events: [NewPumpEvent] = [NewPumpEvent.basal(dose: basalDose, date: basalDose.startDate)]
-                    if dose.type == .tempBasal {
-                        // Record finalized temp basal, resume/basal is already finalized
-                        events.append(NewPumpEvent.tempBasal(dose: dose, date: dose.startDate))
-                    }
-
-                    pumpManager.emitPumpEvents(events)
-                    pumpManager.notifyStateDidChange()
-                }
-
+                events.append(contentsOf: recordSuspendIfDelivering(
+                    state: state, basal: basal, receivedAt: syncDate
+                ))
                 state.basalState = .suspended
 
             default:
-                if state.basalDose.type == .suspend || state.basalDose.type == .tempBasal {
-                    // unfinalized dose is finalized!
-                    let eventTime = Date.now
-                    let dose = state.basalDose.toDoseEntry(isMutable: false, endDate: eventTime)
-                    state.basalDose = dose.type == .tempBasal ?
-                        UnfinalizedDose(
-                            basalRate: state.currentBaseBasalRate,
-                            insulinType: state.insulinType
-                        ) :
-                        UnfinalizedDose(
-                            resumeStartTime: eventTime,
-                            insulinType: state.insulinType
-                        )
+                // The patch is delivering on its schedule again
+                let eventTime = syncDate
 
-                    let basalDose = state.basalDose.toDoseEntry(isMutable: true)
-                    var events: [NewPumpEvent] = [
-                        basalDose.type == .resume ?
-                            NewPumpEvent.resume(dose: basalDose, date: basalDose.startDate) :
-                            NewPumpEvent.basal(dose: basalDose, date: basalDose.startDate)
-                    ]
-                    if dose.type == .tempBasal {
-                        // Record finalized temp basal, suspend is already finalized
-                        events.append(NewPumpEvent.tempBasal(dose: dose, date: dose.startDate))
-                    }
+                switch state.basalDose.type {
+                case .tempBasal:
+                    // A temp basal was running - finalize it, and go back to scheduled basal
+                    let finishedTempBasal = state.basalDose.toDoseEntry(isMutable: false, endDate: eventTime)
+                    state.basalDose = UnfinalizedDose(
+                        basalRate: state.currentBaseBasalRate,
+                        insulinType: state.insulinType
+                    )
 
-                    pumpManager.emitPumpEvents(events)
-                    pumpManager.notifyStateDidChange()
+                    events.append(NewPumpEvent.basal(dose: state.basalDose.toDoseEntry()))
+                    // Record finalized temp basal, the scheduled basal above is already finalized
+                    events.append(NewPumpEvent.tempBasal(dose: finishedTempBasal))
+
+                case .suspend:
+                    // Delivery was suspended - report the resume. The suspend is already finalized.
+                    state.basalDose = UnfinalizedDose(
+                        resumeStartTime: eventTime,
+                        insulinType: state.insulinType
+                    )
+
+                    events.append(NewPumpEvent.resume(dose: state.basalDose.toDoseEntry()))
+
+                default:
+                    break
                 }
 
                 state.basalState = .active
@@ -135,14 +131,58 @@ enum StateSyncer {
                 completed: bolusProgress.completed,
                 useEstimatedEndDate: duringReconnect
             )
-            pumpManager.state.bolusState = bolusProgress.completed ? .noBolus : .inProgress
         } else if duringReconnect {
             pumpManager.checkBolusDone()
-        } else {
-            pumpManager.state.bolusState = .noBolus
+        }
+
+        if fullSync || !events.isEmpty {
+            pumpManager.state.lastSync = syncDate
+            pumpManager.emitPumpEvents(events)
         }
 
         pumpManager.notifyStateDidChange()
+    }
+
+    private static func recordSuspendIfDelivering(
+        state: MedtrumPumpState,
+        basal: BasalData?,
+        receivedAt: Date
+    ) -> [NewPumpEvent] {
+        guard state.basalDose.type == .basal || state.basalDose.type == .resume || state.basalDose.type == .tempBasal
+        else {
+            return []
+        }
+
+        var events: [NewPumpEvent] = []
+        // accurate time would require pump-history reconciliation
+        let eventTime: Date
+        if let basal = basal,
+           basal.type.isSuspendedByPump(),
+           basal.startTime >= state.basalDose.startDate,
+           basal.startTime <= receivedAt
+        {
+            eventTime = basal.startTime
+        } else {
+            eventTime = receivedAt
+        }
+        let dose = state.basalDose.toDoseEntry(isMutable: false, endDate: eventTime)
+        state.basalDose = UnfinalizedDose(suspendStartTime: eventTime)
+
+        events.append(NewPumpEvent.suspend(dose: state.basalDose.toDoseEntry()))
+        if dose.type == .tempBasal {
+            events.append(NewPumpEvent.tempBasal(dose: dose))
+        }
+
+        return events
+    }
+
+    public static func fetchPatchTimeIfStale(pumpManager: MedtrumPumpManager) {
+        let age = Date.now.timeIntervalSince(pumpManager.state.pumpTimeSyncedAt)
+        guard age > MedtrumPumpManager.patchTimeRefreshInterval else {
+            return
+        }
+
+        fetchPatchTime(pumpManager: pumpManager)
     }
 
     public static func fetchPatchTime(pumpManager: MedtrumPumpManager) {
@@ -187,10 +227,14 @@ enum StateSyncer {
     }
 
     private static func updatePumpState(syncResponse: SynchronizePacketResponse, pumpManager: MedtrumPumpManager) {
+        let previousState = pumpManager.state.pumpState
         pumpManager.state.pumpState = syncResponse.state
 
+        guard syncResponse.state != previousState else {
+            return
+        }
+
         // Send notification for specific states
-        // If this has already been done, iOS will remove the old one
         switch syncResponse.state {
         case .dailyMaxSuspended:
             pumpManager.emitAlert(alertType: .patchDailyMaxNotification)

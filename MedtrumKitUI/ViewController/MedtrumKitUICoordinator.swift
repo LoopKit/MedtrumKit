@@ -13,6 +13,7 @@ enum MedtrumUIScreen {
     case patchPrimingScreen
     case patchActivationScreen
     case settingsScreen
+    case manualTempBasalScreen
     case patchDetailsScreen
     case patchPreviousDetailsScreen
 }
@@ -25,6 +26,10 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
     private var allowedInsulinTypes: [InsulinType]
     private var allowDebugFeatures: Bool
     private let logger = MedtrumLogger(category: "MedtrumKitUICoordinator")
+
+    deinit {
+        logger.info("MedtrumKitUICoordinator deallocated")
+    }
 
     var pumpManagerOnboardingDelegate: (any LoopKitUI.PumpManagerOnboardingDelegate)?
     var completionDelegate: (any LoopKitUI.CompletionDelegate)?
@@ -86,18 +91,21 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
             return [.welcomeScreen]
         }
 
-        if pumpManager.state.pumpState.rawValue < PatchState.priming.rawValue {
+        let pumpState = pumpManager.state.pumpState
+
+        if pumpState.isBeforePriming {
             return [.settingsScreen, .pumpBaseSettingsScreen]
         }
 
-        if pumpManager.state.pumpState.rawValue < PatchState.primed.rawValue {
+        if pumpState == .priming {
             return [.patchPrimingScreen]
         }
 
-        if pumpManager.state.pumpState.rawValue < PatchState.active.rawValue {
+        if pumpState.hasCompletedPriming {
             return [.patchActivationScreen]
         }
 
+        // running or terminated
         return [.settingsScreen]
     }
 
@@ -105,12 +113,13 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
         switch screen {
         case .welcomeScreen:
             return hostingController(
-                rootView: OnboardingWelcomeView(nextStep: { self.navigateTo(.insulinTypeScreen) }),
+                rootView: OnboardingWelcomeView(nextStep: { [weak self] in self?.navigateTo(.insulinTypeScreen) }),
                 title: String(localized: "Welcome", comment: "welcome header")
             )
 
         case .insulinTypeScreen:
-            let nextStep: (InsulinType) -> Void = { insulinType in
+            let nextStep: (InsulinType) -> Void = { [weak self] insulinType in
+                guard let self else { return }
                 self.pumpManager?.state.insulinType = insulinType
                 self.pumpManager?.notifyStateDidChange()
 
@@ -131,7 +140,8 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
             )
 
         case .patchSettingsScreen:
-            let nextStep = {
+            let nextStep = { [weak self] in
+                guard let self else { return }
                 if let pumpManager = self.pumpManager, pumpManager.isOnboarded {
                     return
                 }
@@ -158,7 +168,7 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
             )
 
         case .deactivatePatchScreen:
-            let nextStep = { self.resetNavigationTo([.settingsScreen, .pumpBaseSettingsScreen]) }
+            let nextStep: () -> Void = { [weak self] in self?.resetNavigationTo([.settingsScreen, .pumpBaseSettingsScreen]) }
             let viewModel = DeactivatePatchViewModel(pumpManager, nextStep)
             return hostingController(
                 rootView: PatchDeactivationView(viewModel: viewModel),
@@ -166,7 +176,8 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
             )
 
         case .pumpBaseSettingsScreen:
-            let nextStep = {
+            let nextStep = { [weak self] in
+                guard let self else { return }
                 if let pumpManager = self.pumpManager {
                     pumpManager.state.isOnboarded = true
                     pumpManager.notifyStateDidChange()
@@ -191,9 +202,8 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
         case .patchPrimingScreen:
             let viewModel = PatchPrimingViewModel(
                 pumpManager,
-                { self.resetNavigationTo([.patchActivationScreen]) },
-                { self.navigateTo(.pumpBaseSettingsScreen) },
-                { self.resetNavigationTo([.settingsScreen]) }
+                { [weak self] in self?.resetNavigationTo([.patchActivationScreen]) },
+                { [weak self] in self?.resetNavigationTo([.settingsScreen]) }
             )
             return hostingController(
                 rootView: PatchPrimingView(viewModel: viewModel)
@@ -204,8 +214,7 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
         case .patchActivationScreen:
             let viewModel = PatchActivationViewModel(
                 pumpManager,
-                { self.resetNavigationTo([.settingsScreen]) },
-                { self.navigateTo(.patchPrimingScreen) }
+                { [weak self] in self?.resetNavigationTo([.settingsScreen]) }
             )
             return hostingController(
                 rootView: PatchActivationView(viewModel: viewModel)
@@ -214,26 +223,29 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
             )
 
         case .settingsScreen:
-            let toDeactivation = {
-                self.navigateTo(.deactivatePatchScreen)
+            let toDeactivation: () -> Void = { [weak self] in
+                self?.navigateTo(.deactivatePatchScreen)
             }
-            let toActivation: (Bool) -> Void = { alreadyPrimed in
-                self.navigateTo(alreadyPrimed ? .patchActivationScreen : .patchPrimingScreen)
+            let toActivation: (Bool) -> Void = { [weak self] alreadyPrimed in
+                self?.navigateTo(alreadyPrimed ? .patchActivationScreen : .patchPrimingScreen)
             }
-            let toSettings = {
-                self.navigateTo(.patchSettingsScreen)
+            let toSettings: () -> Void = { [weak self] in
+                self?.navigateTo(.patchSettingsScreen)
             }
-            let toPatchDetails = {
-                self.navigateTo(.patchDetailsScreen)
+            let toTempBasal: () -> Void = { [weak self] in
+                self?.navigateTo(.manualTempBasalScreen)
             }
-            let toPreviousPatchDetails = {
-                self.navigateTo(.patchPreviousDetailsScreen)
+            let toPatchDetails: () -> Void = { [weak self] in
+                self?.navigateTo(.patchDetailsScreen)
             }
-            let toInsulinType = {
-                self.navigateTo(.insulinTypeScreen)
+            let toPreviousPatchDetails: () -> Void = { [weak self] in
+                self?.navigateTo(.patchPreviousDetailsScreen)
             }
-            let toActivatePatch = {
-                self.navigateTo(.pumpBaseSettingsScreen)
+            let toInsulinType: () -> Void = { [weak self] in
+                self?.navigateTo(.insulinTypeScreen)
+            }
+            let toActivatePatch: () -> Void = { [weak self] in
+                self?.navigateTo(.pumpBaseSettingsScreen)
             }
 
             let viewModel = MedtrumKitSettingsViewModel(
@@ -241,16 +253,32 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
                 toDeactivation,
                 toActivation,
                 toSettings,
+                toTempBasal,
                 toPatchDetails,
                 toPreviousPatchDetails,
                 toInsulinType,
-                pumpRemoval,
+                { [weak self] in self?.pumpRemoval() },
                 toActivatePatch
             )
             return hostingController(
                 rootView: MedtrumKitSettings(viewModel: viewModel),
                 title: pumpManager?.state.pumpName ?? "Medtrum Nano"
             )
+
+        case .manualTempBasalScreen:
+            let viewModel = ManualTempBasalViewModel(
+                pumpManager: pumpManager,
+                goBack: { [weak self] in
+                    guard let self else { return }
+                    self.screenStack.removeLast()
+                    self.popViewController(animated: true)
+                }
+            )
+            return hostingController(
+                rootView: ManualTempBasalView(viewModel: viewModel),
+                title: String(localized: "Manual Temp Basal", comment: "header manual temp basal")
+            )
+
         case .patchDetailsScreen:
             let viewModel = PatchDetailsViewModel(pumpManager: pumpManager)
             return hostingController(
@@ -295,8 +323,10 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
             return
         }
 
+        pumpManager.forgetBluetoothManager()
         pumpManager.notifyDelegateOfDeactivation {
             DispatchQueue.main.async {
+                self.pumpManager = nil
                 completionDelegate.completionNotifyingDidComplete(self)
             }
         }
