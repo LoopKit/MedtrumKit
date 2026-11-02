@@ -324,11 +324,10 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
         }
 
         pumpManager.forgetBluetoothManager()
-        pumpManager.notifyDelegateOfDeactivation {
-            DispatchQueue.main.async {
-                self.pumpManager = nil
-                completionDelegate.completionNotifyingDidComplete(self)
-            }
+        Task {
+            await pumpManager.delete()
+            self.pumpManager = nil
+            completionDelegate.completionNotifyingDidComplete(self)
         }
     }
 }
