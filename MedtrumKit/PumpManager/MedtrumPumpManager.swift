@@ -874,6 +874,7 @@ public extension MedtrumPumpManager {
             events.append(contentsOf: self.finalizeInterruptedBolus())
             events.append(NewPumpEvent.suspend(dose: suspendDose.toDoseEntry()))
 
+            self.retractExpiryAlert()
             self.state.patchId = Data()
             self.state.pumpState = .none
             self.state.backupSessionToken = self.state.sessionToken
@@ -911,6 +912,7 @@ public extension MedtrumPumpManager {
             reservoirLevel: state.reservoir
         )
 
+        retractExpiryAlert()
         state.patchId = Data()
         state.pumpState = .none
         state.backupSessionToken = state.sessionToken
@@ -1033,6 +1035,17 @@ public extension MedtrumPumpManager {
                         }
                     )
                 }
+            }
+        }
+    }
+
+    // Loop keeps a pending delayed alert when one with the same identifier is issued again,
+    // so the old patch's reminder must go before the next patch schedules its own.
+    private func retractExpiryAlert() {
+        let identifier = MedtrumAlert.patchExpiredNotification(after: 0).alert.identifier
+        pumpDelegate.notify { delegate in
+            Task {
+                await delegate?.retractAlert(identifier: identifier)
             }
         }
     }
