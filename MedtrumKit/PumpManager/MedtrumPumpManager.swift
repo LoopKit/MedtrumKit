@@ -365,7 +365,7 @@ public extension MedtrumPumpManager {
     }
 
     func enactBolus(
-        decisionId: UUID?,
+        doseId: UUID,
         units: Double,
         activationType: LoopKit.BolusActivationType,
         completion: @escaping (LoopKit.PumpManagerError?) -> Void
@@ -404,7 +404,7 @@ public extension MedtrumPumpManager {
             }
 
             let doseEntry = UnfinalizedDose(
-                decisionId: decisionId,
+                doseId: doseId,
                 units: units,
                 duration: duration,
                 activationType: activationType,
@@ -479,16 +479,16 @@ public extension MedtrumPumpManager {
     }
 
     func enactTempBasal(
-        decisionId: UUID?,
+        doseId: UUID,
         unitsPerHour: Double,
         for duration: TimeInterval,
         completion: @escaping (LoopKit.PumpManagerError?) -> Void
     ) {
-        enactTempBasal(decisionId: decisionId, unitsPerHour: unitsPerHour, duration: duration, automatic: true, completion: completion)
+        enactTempBasal(doseId: doseId, unitsPerHour: unitsPerHour, duration: duration, automatic: true, completion: completion)
     }
 
     func enactTempBasal(
-        decisionId: UUID?,
+        doseId: UUID?,
         unitsPerHour: Double,
         duration: TimeInterval,
         automatic: Bool,
@@ -547,7 +547,7 @@ public extension MedtrumPumpManager {
             self.log.info("Set temp basal!")
 
             let tempBasalDose = UnfinalizedDose(
-                decisionId: decisionId,
+                doseId: doseId,
                 tempRate: unitsPerHour,
                 duration: duration,
                 insulinType: self.state.insulinType,
