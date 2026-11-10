@@ -111,15 +111,6 @@ public class MedtrumPumpManager: DeviceManager {
         MedtrumPumpManager.onboardingSupportedBolusVolumes
     }
 
-    public var delegateQueue: DispatchQueue! {
-        get {
-            pumpDelegate.queue
-        }
-        set {
-            pumpDelegate.queue = newValue
-        }
-    }
-
     public func roundToSupportedBolusVolume(units: Double) -> Double {
         // We do support rounding down to 0.00u
         supportedBolusVolumes.last(where: { $0 <= units }) ?? 0
@@ -215,7 +206,7 @@ public class MedtrumPumpManager: DeviceManager {
                 return
             }
 
-            delegate.pumpManagerBLEHeartbeatDidFire(self)
+            await delegate.pumpManagerBLEHeartbeatDidFire(self)
         }
     }
 
@@ -291,7 +282,7 @@ public extension MedtrumPumpManager {
                     self.state.initialReservoir = self.state.reservoir
                 }
 
-                delegate?.pumpManager(self, didReadReservoirValue: self.state.reservoir, at: Date.now) { _ in }
+                _ = try? await delegate?.pumpManager(self, didReadReservoirValue: self.state.reservoir, at: Date.now)
 
                 self.state.lastSync = Date.now
                 self.notifyStateDidChange()
@@ -1001,7 +992,7 @@ public extension MedtrumPumpManager {
             let oldStatus = self.status(self.oldState)
 
             self.pumpDelegate.notify { delegate in
-                delegate?.pumpManagerDidUpdateState(self)
+                await delegate?.pumpManagerDidUpdateState(self)
                 delegate?.pumpManager(self, didUpdate: status, oldStatus: oldStatus)
             }
 
@@ -1015,25 +1006,18 @@ public extension MedtrumPumpManager {
 
     internal func emitAlert(alertType: MedtrumAlert) {
         pumpDelegate.notify { delegate in
-            // PumpManagerDelegate.issueAlert is async. Both calls stay inside one
-            // Task so the alert is still issued before the pump event, as it was
-            // when the delegate API was synchronous -- wrapping only the alert
-            // would let the two race.
-            Task {
-                await delegate?.issueAlert(alertType.alert)
+            await delegate?.issueAlert(alertType.alert)
 
-                if let pumpEvent = NewPumpEvent.alert(type: alertType) {
-                    delegate?.pumpManager(
+            if let pumpEvent = NewPumpEvent.alert(type: alertType) {
+                do {
+                    try await delegate?.pumpManager(
                         self,
                         hasNewPumpEvents: [pumpEvent],
                         lastReconciliation: self.state.lastSync,
-                        replacePendingEvents: false,
-                        completion: { error in
-                            if let error = error {
-                                self.handlePumpDelegateError(method: "hasNewPumpEvents", error)
-                            }
-                        }
+                        replacePendingEvents: false
                     )
+                } catch {
+                    self.handlePumpDelegateError(method: "hasNewPumpEvents", error)
                 }
             }
         }
@@ -1044,9 +1028,7 @@ public extension MedtrumPumpManager {
     private func retractExpiryAlert() {
         let identifier = MedtrumAlert.patchExpiredNotification(after: 0).alert.identifier
         pumpDelegate.notify { delegate in
-            Task {
-                await delegate?.retractAlert(identifier: identifier)
-            }
+            await delegate?.retractAlert(identifier: identifier)
         }
     }
 
@@ -1074,17 +1056,14 @@ public extension MedtrumPumpManager {
                 return
             }
 
-            delegate.pumpManager(
-                self,
-                didReadReservoirValue: self.state.reservoir.rounded(toPlaces: 1),
-                at: self.state.lastSync
-            ) { result in
-                switch result {
-                case let .failure(error):
-                    self.handlePumpDelegateError(method: "didReadReservoirValue", error)
-                case .success:
-                    break
-                }
+            do {
+                _ = try await delegate.pumpManager(
+                    self,
+                    didReadReservoirValue: self.state.reservoir.rounded(toPlaces: 1),
+                    at: self.state.lastSync
+                )
+            } catch {
+                self.handlePumpDelegateError(method: "didReadReservoirValue", error)
             }
         }
 
@@ -1116,7 +1095,7 @@ public extension MedtrumPumpManager {
                 return
             }
 
-            delegate.pumpManager(self, didError: .uncertainDelivery)
+            await delegate.pumpManager(self, didError: .uncertainDelivery)
         }
 
         emitPumpEvents(events)
@@ -1140,7 +1119,7 @@ public extension MedtrumPumpManager {
                 return
             }
 
-            delegate.pumpManager(self, didError: .uncertainDelivery)
+            await delegate.pumpManager(self, didError: .uncertainDelivery)
         }
 
         return [NewPumpEvent.bolus(dose: dose)]
@@ -1200,17 +1179,14 @@ public extension MedtrumPumpManager {
 
     func emitReservoirLevel() {
         pumpDelegate.notify { delegate in
-            delegate?.pumpManager(
-                self,
-                didReadReservoirValue: self.state.reservoir.rounded(toPlaces: 1),
-                at: Date.now
-            ) { result in
-                switch result {
-                case let .failure(error):
-                    self.handlePumpDelegateError(method: "didReadReservoirValue", error)
-                case .success:
-                    break
-                }
+            do {
+                _ = try await delegate?.pumpManager(
+                    self,
+                    didReadReservoirValue: self.state.reservoir.rounded(toPlaces: 1),
+                    at: Date.now
+                )
+            } catch {
+                self.handlePumpDelegateError(method: "didReadReservoirValue", error)
             }
         }
     }
@@ -1237,15 +1213,15 @@ public extension MedtrumPumpManager {
                 return
             }
 
-            delegate.pumpManager(
-                self,
-                hasNewPumpEvents: events,
-                lastReconciliation: self.state.lastSync,
-                replacePendingEvents: replacePendingEvents
-            ) { error in
-                if let error = error {
-                    self.handlePumpDelegateError(method: "hasNewPumpEvents", error)
-                }
+            do {
+                try await delegate.pumpManager(
+                    self,
+                    hasNewPumpEvents: events,
+                    lastReconciliation: self.state.lastSync,
+                    replacePendingEvents: replacePendingEvents
+                )
+            } catch {
+                self.handlePumpDelegateError(method: "hasNewPumpEvents", error)
             }
         }
     }
