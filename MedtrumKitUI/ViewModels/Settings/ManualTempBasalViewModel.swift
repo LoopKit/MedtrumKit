@@ -59,7 +59,7 @@ class ManualTempBasalViewModel: ObservableObject {
         enacting = true
         pumpManager.syncPumpData { _ in
             pumpManager.enactTempBasal(
-                decisionId: nil,
+                doseId: nil,
                 unitsPerHour: self.selectedRate,
                 duration: self.selectedDuration,
                 automatic: false
