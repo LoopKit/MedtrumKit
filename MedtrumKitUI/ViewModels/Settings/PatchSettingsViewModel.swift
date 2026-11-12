@@ -135,13 +135,8 @@ class PatchSettingsViewModel: ObservableObject {
         pumpManager.notifyStateDidChange()
 
         pumpManager.pumpDelegate.notify { delegate in
-            // retractAlert and issueAlert are async in LoopKit. Both stay in one
-            // Task so the old notification is still retracted before the new one
-            // is issued -- reversing them would leave the stale alert in place.
-            Task {
-                await delegate?.retractAlert(identifier: MedtrumAlert.patchExpiredNotification(after: .hours(1)).alert.identifier)
-                await delegate?.issueAlert(MedtrumAlert.patchExpiredNotification(after: self.notificationAfterActivation).alert)
-            }
+            await delegate?.retractAlert(identifier: MedtrumAlert.patchExpiredNotification(after: .hours(1)).alert.identifier)
+            await delegate?.issueAlert(MedtrumAlert.patchExpiredNotification(after: self.notificationAfterActivation).alert)
         }
     }
 }

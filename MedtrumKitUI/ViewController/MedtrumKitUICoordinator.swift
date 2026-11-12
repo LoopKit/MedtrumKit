@@ -313,10 +313,7 @@ class MedtrumKitUICoordinator: UINavigationController, PumpManagerOnboarding, Co
 
     private func pumpRemoval() {
         pumpManager?.pumpDelegate.notify { delegate in
-            // retractAlert is async in LoopKit.
-            Task {
-                await delegate?.retractAlert(identifier: MedtrumAlert.patchExpiredNotification(after: .hours(1)).alert.identifier)
-            }
+            await delegate?.retractAlert(identifier: MedtrumAlert.patchExpiredNotification(after: .hours(1)).alert.identifier)
         }
 
         guard let completionDelegate = self.completionDelegate, let pumpManager = self.pumpManager else {
