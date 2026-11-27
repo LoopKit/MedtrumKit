@@ -247,7 +247,8 @@ public extension MedtrumPumpManager {
             pumpBatteryChargeRemaining: nil, // Patch pumps do not need to report back battery status
             basalDeliveryState: state.basalDeliveryState,
             bolusState: state.bolusDeliveryState,
-            insulinType: state.insulinType
+            insulinType: state.insulinType,
+            reservoirLevel: state.patchId.isEmpty ? nil : .measured(units: state.pumpState == .reservoirEmpty ? 0 : state.reservoir)
         )
     }
 
