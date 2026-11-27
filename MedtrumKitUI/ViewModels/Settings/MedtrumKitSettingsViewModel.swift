@@ -65,14 +65,6 @@ class MedtrumKitSettingsViewModel: PatchLifetimeFormatting, ObservableObject, Pu
         pumpManager?.state.pumpName ?? "Medtrum Nano"
     }
 
-    let reservoirVolumeFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.roundingMode = .floor
-        formatter.minimumFractionDigits = 0
-        formatter.maximumFractionDigits = 0
-        return formatter
-    }()
-
     let basalRateFormatter: NumberFormatter = {
         let numberFormatter = NumberFormatter()
         numberFormatter.numberStyle = .decimal
@@ -151,7 +143,7 @@ class MedtrumKitSettingsViewModel: PatchLifetimeFormatting, ObservableObject, Pu
     }
 
     func reservoirText(for units: Double) -> String {
-        reservoirVolumeFormatter.string(from: units as NSNumber) ?? ""
+        ReservoirLevel.measured(units: units).formatted(includeUnit: false)
     }
 
     var tempBasalRemaining: String? {
